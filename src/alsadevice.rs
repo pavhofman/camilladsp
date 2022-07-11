@@ -429,6 +429,8 @@ fn playback_loop_bytes(
     }
     let mut capture_speed: f64 = 1.0;
     let mut prev_delay_diff: Option<f64> = None;
+    // for delay calculation several chunks are skipped to let the processing warm up
+    let mut chunks_to_skip_delay_calc = 2;
     loop {
         let eos_in_drain = if device_stalled {
             drain_check_eos(&channels.audio)
@@ -448,12 +450,17 @@ fn playback_loop_bytes(
                 // measure delay only on running non-stalled device
                 let delay_at_chunk_recvd = if !device_stalled
                     && pcmdevice.state_raw() == alsa_sys::SND_PCM_STATE_RUNNING as i32
+                    && chunks_to_skip_delay_calc == 0
                 {
                     pcmdevice.status().ok().map(|status| status.get_delay())
                 } else {
                     None
                 };
                 //trace!("PB: Delay at chunk rcvd: {:?}", delay_at_chunk_recvd);
+
+                if chunks_to_skip_delay_calc > 0 {
+                    chunks_to_skip_delay_calc -= 1;
+                }
 
                 conversion_result =
                     chunk_to_buffer_rawbytes(&chunk, &mut buffer, &params.sample_format);
