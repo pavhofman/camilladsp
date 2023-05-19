@@ -20,6 +20,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
+use std::time::Duration;
 
 use crate::alsadevice_buffermanager::{
     CaptureBufferManager, DeviceBufferManager, PlaybackBufferManager,
@@ -92,7 +93,6 @@ struct CaptureParams {
 
 struct PlaybackParams {
     channels: usize,
-    target_level: usize,
     adjust_period: f32,
     adjust_enabled: bool,
     sample_format: SampleFormat,
@@ -429,6 +429,8 @@ fn playback_loop_bytes(
     }
     let mut capture_speed: f64 = 1.0;
     let mut prev_delay_diff: Option<f64> = None;
+    let mut base_chunk_duration: Option<Duration> = None;
+    let mut target_level: Option<usize> = None;
     loop {
         let eos_in_drain = if device_stalled {
             drain_check_eos(&channels.audio)
@@ -449,7 +451,25 @@ fn playback_loop_bytes(
                 let delay_at_chunk_recvd = if !device_stalled
                     && pcmdevice.state_raw() == alsa_sys::SND_PCM_STATE_RUNNING as i32
                 {
-                    pcmdevice.status().ok().map(|status| status.get_delay())
+                    pcmdevice.status().ok().map(|status| {
+                        let mut delay = status.get_delay() as f64;
+                        let chunk_duration = Instant::now() - chunk.timestamp;
+                        trace!("Chunk duration {:?}", chunk_duration);
+                        if base_chunk_duration.is_some() {
+                            let duration_diff: Duration = chunk_duration - base_chunk_duration.unwrap();
+                            // adjusting frames delay for the duration difference between the current and the base chunk
+                            let delay_adjustment: f64 = duration_diff.as_secs_f64() * params.samplerate as f64;
+                            // longer chunk processing => more samples consumed by the soundcard => lower adjusted delay
+                            delay -= delay_adjustment;
+                        } else {
+                            // setting initial values
+                            base_chunk_duration = Some(chunk_duration);
+                            // delay at base chunk is the target level
+                            target_level = Some(delay as usize);
+                            info!("Using target_level {} frames", target_level.unwrap());
+                        }
+                        delay
+                    })
                 } else {
                     None
                 };
@@ -528,8 +548,8 @@ fn playback_loop_bytes(
                             .add_record(chunk_stats.peak_linear());
                     }
                     if let Some(delay) = delay_at_chunk_recvd {
-                        if delay != 0 {
-                            buffer_avg.add_value(delay as f64);
+                        if delay > 0.0 {
+                            buffer_avg.add_value(delay);
                         }
                     }
                     if timer.larger_than_millis((1000.0 * params.adjust_period) as u64) {
@@ -539,7 +559,7 @@ fn playback_loop_bytes(
                             if adjust {
                                 let (new_capture_speed, new_delay_diff) = adjust_speed(
                                     avg_delay,
-                                    params.target_level,
+                                    target_level.unwrap(),
                                     prev_delay_diff,
                                     capture_speed,
                                 );
@@ -939,7 +959,6 @@ impl PlaybackDevice for AlsaPlaybackDevice {
                         debug!("Starting playback loop");
                         let pb_params = PlaybackParams {
                             channels,
-                            target_level,
                             adjust_period,
                             adjust_enabled,
                             sample_format,
